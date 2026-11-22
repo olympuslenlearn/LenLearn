@@ -1,4 +1,4 @@
-import { getRiskLevel, splitIntoSentences } from './plagiarismEngine.js'
+import { getRiskLevel, splitIntoSentences, isQuotedSentence } from './plagiarismEngine.js'
 
 const FLAG_THRESHOLD = 0.35
 const LEXICAL_WEIGHT = 0.4
@@ -150,9 +150,8 @@ export async function embedTexts(texts, provider = getAiProvider()) {
 export async function analyzeTextSemantic(submittedText, referenceSources = []) {
   const submitted = String(submittedText || '').trim()
   const sources = (referenceSources || []).filter((s) => s?.text && String(s.text).trim())
-  const sentences = splitIntoSentences(submitted)
 
-  if (!submitted) {
+  if (!submitted || !sources.length) {
     return {
       similarity_score: 0,
       risk_level: 'Low',
@@ -161,46 +160,69 @@ export async function analyzeTextSemantic(submittedText, referenceSources = []) 
     }
   }
 
-  const textsToEmbed = [submitted, ...sources.map((s) => s.text), ...sentences]
-  const vectors = await embedTexts(textsToEmbed)
-  const submittedVec = vectors[0] || []
-  const sourceVectors = vectors.slice(1, 1 + sources.length)
-  const sentenceVectors = vectors.slice(1 + sources.length)
+  // Passage-level embeddings. The embedding model truncates long inputs (~first
+  // 200 words), so embedding a whole document or a whole source only captured its
+  // opening. Instead we split BOTH the submission and each source into short
+  // passages and compare passage-to-passage, so the entire document is covered.
+  const MAX_SUB_SENTENCES = 150
+  const MAX_SRC_PASSAGES = 40
 
-  const sourceScores = sources.map((source, index) => {
-    const sim = vectorCosineSimilarity(submittedVec, sourceVectors[index] || [])
-    return {
-      url: String(source.url || '').trim(),
-      title: String(source.title || source.url || 'Unknown source').trim(),
-      similarity_score: Math.round(sim * 1000) / 10,
-    }
+  let sentences = splitIntoSentences(submitted).slice(0, MAX_SUB_SENTENCES)
+  if (!sentences.length) sentences = [submitted.slice(0, 500)]
+
+  const sourcePassages = sources.map((s) => {
+    const passages = splitIntoSentences(String(s.text))
+    return passages.length ? passages.slice(0, MAX_SRC_PASSAGES) : [String(s.text).slice(0, 500)]
   })
 
-  const simValues = sourceScores.map((s) => s.similarity_score / 100)
-  const similarity_score = combinedScore(simValues)
+  // Flatten source passages, remembering which source each belongs to.
+  const flatPassages = []
+  const passageOwner = []
+  sourcePassages.forEach((passages, si) => {
+    passages.forEach((p) => {
+      flatPassages.push(p)
+      passageOwner.push(si)
+    })
+  })
 
+  const vectors = await embedTexts([...sentences, ...flatPassages])
+  const sentenceVectors = vectors.slice(0, sentences.length)
+  const passageVectors = vectors.slice(sentences.length)
+
+  const perSourceBest = new Array(sources.length).fill(0)
   const flagged_sentences = []
+
   for (let i = 0; i < sentences.length; i += 1) {
-    const sentence = sentences[i]
     const sentenceVec = sentenceVectors[i] || []
     let bestSim = 0
     let bestSource = null
-    for (let j = 0; j < sources.length; j += 1) {
-      const sim = vectorCosineSimilarity(sentenceVec, sourceVectors[j] || [])
+    for (let p = 0; p < passageVectors.length; p += 1) {
+      const sim = vectorCosineSimilarity(sentenceVec, passageVectors[p] || [])
+      const si = passageOwner[p]
+      if (sim > perSourceBest[si]) perSourceBest[si] = sim
       if (sim > bestSim) {
         bestSim = sim
-        bestSource = sources[j]
+        bestSource = sources[si]
       }
     }
-    if (bestSim >= FLAG_THRESHOLD && bestSource) {
+    if (bestSim >= FLAG_THRESHOLD && bestSource && !isQuotedSentence(sentences[i])) {
       flagged_sentences.push({
-        sentence,
+        sentence: sentences[i],
         similarity: Math.round(bestSim * 1000) / 10,
         source_url: String(bestSource.url || '').trim(),
         source_title: String(bestSource.title || bestSource.url || '').trim(),
       })
     }
   }
+
+  const sourceScores = sources.map((source, index) => ({
+    url: String(source.url || '').trim(),
+    title: String(source.title || source.url || 'Unknown source').trim(),
+    similarity_score: Math.round(perSourceBest[index] * 1000) / 10,
+  }))
+
+  const simValues = sourceScores.map((s) => s.similarity_score / 100)
+  const similarity_score = combinedScore(simValues)
 
   flagged_sentences.sort((a, b) => b.similarity - a.similarity)
 

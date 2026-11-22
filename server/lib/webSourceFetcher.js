@@ -1,21 +1,75 @@
-const FETCH_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (compatible; LenLearn-OriginalityChecker/1.0)',
-  Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8',
+import { createRequire } from 'node:module'
+
+// pdf-parse is already a project dependency (used by documentParser.js); load it
+// the same way so PDF sources (research articles) can be read, not skipped.
+const require = createRequire(import.meta.url)
+let pdfParse = null
+try {
+  pdfParse = require('pdf-parse')
+} catch {
+  pdfParse = null
 }
 
-const PAGE_TIMEOUT_MS = 5000
-const OVERALL_TIMEOUT_MS = 10000
-const MAX_SOURCES = 8
-const MAX_PAGE_TEXT = 3000
+const FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (compatible; LenLearn-OriginalityChecker/1.0)',
+  Accept: 'text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.8',
+}
 
-/** DuckDuckGo HTML search — sole web source discovery method (no API key). */
-/** @param {string} query */
-export async function searchWeb(query) {
-  const q = String(query || '').trim()
-  if (!q) return []
+// Tuned upward from the original (5s / 10s / 8 sources / 3000 chars) so a wider
+// set of sources can be discovered and read per check.
+const PAGE_TIMEOUT_MS = 8000
+const OVERALL_TIMEOUT_MS = 20000
+const MAX_SOURCES = 15
+const RESULTS_PER_QUERY = 6
+const MAX_PAGE_TEXT = 5000
+
+/**
+ * Real search API (Serper.dev) — primary source discovery when SERPER_API_KEY
+ * is configured. Returns far broader coverage of articles and research than the
+ * DuckDuckGo HTML fallback below. One simple JSON request per query.
+ * @param {string} query
+ */
+async function searchSerper(query) {
+  const apiKey = String(process.env.SERPER_API_KEY || '').trim()
+  if (!apiKey) return null // signal "not configured" → caller falls back
 
   try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS)
+    const res = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'X-API-KEY': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ q: query, num: RESULTS_PER_QUERY }),
+    })
+    clearTimeout(timer)
+    if (!res.ok) return []
+
+    const data = await res.json().catch(() => ({}))
+    const organic = Array.isArray(data?.organic) ? data.organic : []
+    const results = []
+    const seen = new Set()
+    for (const item of organic) {
+      const link = String(item?.link || '').trim()
+      if (!link.startsWith('http') || seen.has(link)) continue
+      seen.add(link)
+      results.push({ url: link, title: String(item?.title || link).trim() })
+      if (results.length >= RESULTS_PER_QUERY) break
+    }
+    return results
+  } catch {
+    return []
+  }
+}
+
+/** DuckDuckGo HTML search — fallback when no SERPER_API_KEY is set (no key required). */
+/** @param {string} query */
+async function searchDuckDuckGo(query) {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS)
     const res = await fetch(url, {
@@ -32,7 +86,7 @@ export async function searchWeb(query) {
 
     const uddgRegex = /uddg=([^&"]+)/g
     let match
-    while ((match = uddgRegex.exec(html)) !== null && results.length < 5) {
+    while ((match = uddgRegex.exec(html)) !== null && results.length < RESULTS_PER_QUERY) {
       try {
         const decoded = decodeURIComponent(match[1])
         if (!decoded.startsWith('http') || seen.has(decoded)) continue
@@ -61,6 +115,55 @@ export async function searchWeb(query) {
   }
 }
 
+/**
+ * Web search: use Serper when configured, otherwise fall back to DuckDuckGo.
+ * Keeping the fallback means the checker still works with no API key set.
+ * @param {string} query
+ */
+export async function searchWeb(query) {
+  const q = String(query || '').trim()
+  if (!q) return []
+
+  const viaSerper = await searchSerper(q)
+  if (viaSerper !== null) {
+    // Serper configured. If it returned nothing, still try DuckDuckGo as a backup.
+    if (viaSerper.length) return viaSerper
+    return searchDuckDuckGo(q)
+  }
+  return searchDuckDuckGo(q)
+}
+
+/**
+ * Optional: render a JavaScript-heavy page with a headless browser so its text
+ * can be read. OFF by default. Activates only when ORIGINALITY_JS_RENDER=1 and
+ * the optional `playwright` package is installed (`npm i playwright` then
+ * `npx playwright install chromium`). On any failure it returns null and the
+ * caller keeps the plain-fetch result.
+ * @param {string} url
+ */
+async function renderWithBrowser(url) {
+  if (String(process.env.ORIGINALITY_JS_RENDER || '').trim() !== '1') return null
+  let chromium = null
+  try {
+    ({ chromium } = await import('playwright'))
+  } catch {
+    return null // package not installed
+  }
+  let browser = null
+  try {
+    browser = await chromium.launch({ headless: true })
+    const page = await browser.newPage({ userAgent: FETCH_HEADERS['User-Agent'] })
+    await page.goto(url, { timeout: PAGE_TIMEOUT_MS, waitUntil: 'domcontentloaded' })
+    const text = await page.evaluate(() => document.body?.innerText || '')
+    const cleaned = String(text).replace(/\s+/g, ' ').trim()
+    return cleaned ? cleaned.slice(0, MAX_PAGE_TEXT) : null
+  } catch {
+    return null
+  } finally {
+    try { if (browser) await browser.close() } catch { /* ignore */ }
+  }
+}
+
 /** @param {string} url */
 export async function fetchPageText(url) {
   const target = String(url || '').trim()
@@ -79,6 +182,21 @@ export async function fetchPageText(url) {
     if (!res.ok) return null
 
     const contentType = String(res.headers.get('content-type') || '').toLowerCase()
+
+    // PDF sources (common for research articles) — extract text with pdf-parse.
+    if (contentType.includes('application/pdf') || target.toLowerCase().endsWith('.pdf')) {
+      if (!pdfParse) return null
+      try {
+        const buf = Buffer.from(await res.arrayBuffer())
+        const parsed = await pdfParse(buf)
+        const text = String(parsed?.text || '').replace(/\s+/g, ' ').trim()
+        if (!text) return null
+        return text.slice(0, MAX_PAGE_TEXT)
+      } catch {
+        return null
+      }
+    }
+
     if (!contentType.includes('text/html') && !contentType.includes('text/plain')) {
       return null
     }
@@ -99,6 +217,14 @@ export async function fetchPageText(url) {
       .replace(/\s+/g, ' ')
       .trim()
 
+    // If the plain fetch yielded little text, the page may render its content
+    // with JavaScript. Try the optional headless-browser path (no-op unless
+    // enabled + installed); keep whichever result is longer.
+    if (text.length < 200) {
+      const rendered = await renderWithBrowser(target)
+      if (rendered && rendered.length > text.length) text = rendered
+    }
+
     if (!text) return null
     return text.slice(0, MAX_PAGE_TEXT)
   } catch {
@@ -106,17 +232,48 @@ export async function fetchPageText(url) {
   }
 }
 
-/** @param {string} submittedText */
-export async function getWebSources(submittedText) {
-  const deadline = Date.now() + OVERALL_TIMEOUT_MS
-  const sentences = String(submittedText || '')
+/**
+ * Build search queries that cover MORE of the document than the original
+ * three-longest-sentences approach: the longest sentences plus a few
+ * overlapping word-window chunks, so copied passages anywhere in the text
+ * have a chance of surfacing their source.
+ * @param {string} submittedText
+ */
+function buildQueries(submittedText) {
+  const text = String(submittedText || '')
+  const sentences = text
     .split(/(?<=[.!?])\s+|\n+/)
     .map((s) => s.trim())
     .filter((s) => s.length >= 30)
-    .sort((a, b) => b.length - a.length)
-    .slice(0, 3)
 
-  const queries = sentences.length ? sentences : [String(submittedText || '').slice(0, 120)]
+  const longest = [...sentences].sort((a, b) => b.length - a.length).slice(0, 5)
+
+  // Overlapping ~22-word windows across the document.
+  const words = text.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean)
+  const windows = []
+  const WIN = 22
+  const STEP = 15
+  for (let i = 0; i + 12 < words.length && windows.length < 4; i += STEP) {
+    windows.push(words.slice(i, i + WIN).join(' '))
+  }
+
+  const seen = new Set()
+  const queries = []
+  for (const q of [...longest, ...windows]) {
+    const key = q.toLowerCase().slice(0, 80)
+    if (q && !seen.has(key)) {
+      seen.add(key)
+      queries.push(q)
+    }
+    if (queries.length >= 8) break
+  }
+  return queries.length ? queries : [text.slice(0, 120)]
+}
+
+/** @param {string} submittedText */
+export async function getWebSources(submittedText) {
+  const deadline = Date.now() + OVERALL_TIMEOUT_MS
+  const queries = buildQueries(submittedText)
 
   const urlMap = new Map()
   for (const query of queries) {

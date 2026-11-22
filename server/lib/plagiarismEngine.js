@@ -59,6 +59,17 @@ export function cosineSimilarity(vecA, vecB) {
   return dot / (Math.sqrt(magA) * Math.sqrt(magB))
 }
 
+/**
+ * True when a sentence is wholly wrapped in quotation marks (a properly attributed
+ * quotation), so it can be excluded from plagiarism flagging.
+ * @param {string} sentence
+ */
+export function isQuotedSentence(sentence) {
+  const s = String(sentence || '').trim()
+  if (s.length < 10) return false
+  return /^["'‘’“”].*["'‘’“”][.?!]?$/.test(s)
+}
+
 /** @param {string} text */
 export function splitIntoSentences(text) {
   return String(text || '')
@@ -131,6 +142,9 @@ export function analyzeText(submittedText, referenceSources = []) {
   const sentences = splitIntoSentences(submitted)
 
   for (const sentence of sentences) {
+    // Skip sentences that are properly quoted — a cited quotation is attributed,
+    // not undisclosed copying, so it should not inflate the flagged list.
+    if (isQuotedSentence(sentence)) continue
     let bestSim = 0
     let bestSource = null
     for (const source of sources) {

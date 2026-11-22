@@ -12,7 +12,7 @@ import {
 import { getWebSources } from '../lib/webSourceFetcher.js'
 import { parseFile, extractPdfTextKeepFile } from '../lib/documentParser.js'
 import { detectAiContent } from '../lib/aiContentDetector.js'
-import { deriveAiScoresFromSimilarity } from '../../shared/aiProbabilityBands.js'
+import { comparePeerSubmissions, addSubmissionToCorpus } from '../lib/submissionCorpus.js'
 import {
   getOriginalityUploadFile,
   originalityUploadMiddleware,
@@ -88,7 +88,7 @@ function parseRunAiDetection(raw) {
 
 /** Shared lexical + semantic + optional AI-detection pipeline, used by both the
  * standalone checker and the per-submission "Check Plagiarism" action. */
-async function runPlagiarismPipeline(submittedText, { runAiDetection = false } = {}) {
+async function runPlagiarismPipeline(submittedText, { runAiDetection = false, peerContext = {} } = {}) {
   const webSources = await getWebSources(submittedText)
   const lexicalAnalysis = analyzeText(submittedText, webSources)
   const aiProvider = getAiProvider()
@@ -104,17 +104,36 @@ async function runPlagiarismPipeline(submittedText, { runAiDetection = false } =
 
   let aiDetectionResult = null
   if (runAiDetection) {
-    const rawAi = detectAiContent(submittedText)
-    const derived = deriveAiScoresFromSimilarity(analysis.similarity_score)
-    aiDetectionResult = derived
-      ? {
-          ...rawAi,
-          probability: derived.probability,
-          lexical_score: derived.lexical_score,
-          semantic_score: derived.semantic_score,
-          verdict: derived.verdict,
-        }
-      : rawAi
+    // Use the real content-based detector output. (Previously this was overwritten
+    // with a value derived from the plagiarism similarity score, which did not
+    // reflect the text itself — so identical scores appeared for any text. The
+    // detector remains an experimental writing-style indicator, not proof.)
+    aiDetectionResult = detectAiContent(submittedText)
+  }
+
+  // Peer (submission-to-submission) similarity — fully guarded so any failure
+  // never affects the web-based result. Compares this submission against past
+  // submissions stored in the local corpus, then records this one for future checks.
+  try {
+    const pool = getPgPool()
+    if (pool) {
+      const peer = await comparePeerSubmissions(pool, submittedText, {
+        excludeStudentId: peerContext.studentId,
+      })
+      if (peer) {
+        analysis.peer_similarity_score = peer.peer_similarity_score
+        analysis.peer_matches = peer.peer_matches
+      }
+      if (peerContext.studentId) {
+        await addSubmissionToCorpus(pool, submittedText, {
+          studentId: peerContext.studentId,
+          submissionId: peerContext.submissionId,
+          reportLabel: peerContext.reportLabel,
+        })
+      }
+    }
+  } catch (peerErr) {
+    console.error('[plagiarism] Peer comparison skipped:', peerErr?.message || peerErr)
   }
 
   return { analysis, aiDetectionResult, webSources }
@@ -366,11 +385,16 @@ export function createPlagiarismReportsV1Router(express, auth) {
       }
 
       const runAiDetection = parseRunAiDetection(req.body?.run_ai_detection ?? true)
+      const fileName = submission.file_name || 'submission.pdf'
       const { analysis, aiDetectionResult, webSources } = await runPlagiarismPipeline(parsed.text, {
         runAiDetection,
+        peerContext: {
+          studentId: submission.student_id,
+          submissionId,
+          reportLabel: fileName,
+        },
       })
       const processingTimeMs = Date.now() - startTime
-      const fileName = submission.file_name || 'submission.pdf'
 
       const report = await createPlagiarismReport(pool, facultyRow.id, {
         content: parsed.text,

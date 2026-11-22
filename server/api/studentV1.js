@@ -153,7 +153,13 @@ async function resolveStudentContext(pool, user, res) {
 }
 
 function studentTermsAccepted(row) {
-  return row?.terms_accepted === true
+  // Terms & Conditions gate disabled for students: after sign-in + 2FA they go
+  // straight to the dashboard, without the read-and-accept step. Returning true
+  // makes both /v1/student/terms-status and requireTermsAccepted() pass, so no
+  // student endpoint is blocked and the terms page is never shown.
+  // To restore the gate, change this back to: return row?.terms_accepted === true
+  void row
+  return true
 }
 
 function requireTermsAccepted(studentRow, res) {

@@ -6,6 +6,14 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const pdfParse = require('pdf-parse')
 
+// mammoth is already a project dependency — used to read .docx submissions.
+let mammoth = null
+try {
+  mammoth = require('mammoth')
+} catch {
+  mammoth = null
+}
+
 const MIN_TEXT_LENGTH = 50
 
 /**
@@ -22,14 +30,21 @@ export async function parseFile(filePath, mimeType, originalName) {
   try {
     let text = ''
 
+    const isDocx =
+      ext === '.docx' ||
+      mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
     if (ext === '.txt' || mime === 'text/plain') {
       text = await fs.readFile(abs, 'utf-8')
     } else if (ext === '.pdf' || mime === 'application/pdf') {
       const buffer = fsSync.readFileSync(abs)
       const result = await pdfParse(buffer)
       text = String(result?.text || '')
+    } else if (isDocx && mammoth) {
+      const result = await mammoth.extractRawText({ path: abs })
+      text = String(result?.value || '')
     } else {
-      return { text: null, error: 'Supported formats: .txt, .pdf' }
+      return { text: null, error: 'Supported formats: .txt, .pdf, .docx' }
     }
 
     text = text.replace(/\s+/g, ' ').trim()
